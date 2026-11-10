@@ -13,13 +13,38 @@ const env = (k, d) => (process.env[k] !== undefined && process.env[k] !== '' ? N
 const cleanToken = s => String(s || '').trim().replace(/^["']|["']$/g, '').replace(/^bot/i, '').trim();
 const TOKEN = cleanToken(process.env.TELEGRAM_TOKEN || '9057088871:AAEuy_QNGSkwg6uCtR1_tO-wFHTtweCMhGs');
 const ADMIN_ID = String(process.env.ADMIN_ID || '8161736033'); // bot egasi: faqat u /adduser qila oladi
-const USERS_FILE = path.join(__dirname, 'users.json');
+// Ma'lumotlar papkasi. Kod GitHub orqali yangilanganda ham saqlansin desangiz DATA_DIR ni
+// kod papkasidan tashqarida (yoki doimiy volume) qilib bering. Standart: kod papkasi.
+const DATA_DIR = process.env.DATA_DIR || __dirname;
+try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch {}
+const USERS_FILE = path.join(DATA_DIR, 'users.json');
 const allowedUsers = new Set([
   ADMIN_ID,
   '5693873756',                                  // qo'shimcha foydalanuvchi
   ...(process.env.ALLOWED_IDS || '').split(',').map(s => s.trim()).filter(Boolean),
 ]);
-const DATA_FILE = path.join(__dirname, 'bots.json');
+const DATA_FILE = path.join(DATA_DIR, 'bots.json');
+
+// ---------------- DOIMIY BOTLAR (SEED) ----------------
+// Bu botlar bots.json o'chib ketsa ham har ishga tushganda KODDAN avtomatik tiklanadi
+// (id raqamlari ham o'sha-o'sha). Bor bo'lsa — qayta qo'shilmaydi. Telegramdan /remove qilsangiz
+// qaytib kelmaydi (bots.json o'chib ketmaguncha). Ular har ishga tushganda o'zi ulanadi.
+const SEED_OWNER = String(process.env.SEED_OWNER || ADMIN_ID);   // botlar egasining Telegram ID si
+const SEED = {
+  host: 'online.articraft.uz',
+  port: 25565,
+  version: '1.21.1',
+  password: 'shukrona',
+  authMode: 'login',
+  commands: [],                 // kerak bo'lsa hub buyruqlari: ['/server anarxiya']
+  afterCmd: '/warp afk3',       // hub buyruqlaridan keyingi oxirgi buyruq
+  list: [
+    [1, 'Afsona_94'], [2, 'Tufon_28'], [3, 'Yirtqich_51'], [4, 'Qahramon_39'],
+    [6, 'Shavkat_46'], [8, 'Zafar_92'], [9, 'Mergan_37'], [11, 'Sarvar_81'],
+    [13, 'Dovyurak_14'], [14, 'Ajdahor_63'], [16, 'Golib_25'], [18, 'Shirin_74'],
+    [19, 'Nizom_83'], [20, 'Jasur_19'], [21, 'Temur_48'],
+  ],
+};
 
 const DEFAULT_LOGIN_DELAY_S = env('LOGIN_DELAY_SEC', 3);   // serverga kirgach /login gacha (s)
 const DEFAULT_CMD_DELAY_S = env('CMD_DELAY_SEC', 15);      // /login dan keyin hub buyruqlarigacha (s)
@@ -176,6 +201,7 @@ class AfkBot {
     this.username = cfg.username;
     this.password = cfg.password;
     this.commands = cfg.commands || [];
+    this.seed = !!cfg.seed;                       // koddan tiklanadigan doimiy bot (har ishga tushganda o'zi ulanadi)
     this.afterCmd = cfg.afterCmd || '';           // hub buyruqlaridan keyingi oxirgi buyruq (masalan /warp afk)
     this.authMode = cfg.authMode || 'login';      // 'login' yoki 'register' (faqat birinchi kirishda)
     this.version = cfg.version || false;
@@ -213,7 +239,7 @@ class AfkBot {
     return {
       id: this.id, owner: this.owner, host: this.host, port: this.port,
       username: this.username, password: this.password, commands: this.commands,
-      afterCmd: this.afterCmd, authMode: this.authMode,
+      afterCmd: this.afterCmd, authMode: this.authMode, seed: this.seed,
       version: this.version, loginDelay: this.loginDelay, cmdDelay: this.cmdDelay,
       unlimited: this.unlimited, expiresAt: this.expiresAt, jobs: this.jobs, nextJobId: this.nextJobId,
     };
@@ -593,9 +619,12 @@ class AfkBot {
 // ---------------- BOTLAR REESTRI VA SAQLASH ----------------
 const bots = new Map(); // id -> AfkBot
 let nextBotId = 1;
+const removedSeeds = new Set(); // /remove qilingan doimiy botlar nomi (qayta tiklanmaydi)
+
+function forgetBot(b) { if (b.seed) removedSeeds.add(b.username); }
 
 function saveAll() {
-  const data = { nextId: nextBotId, bots: [...bots.values()].map(b => b.toJSON()) };
+  const data = { nextId: nextBotId, removedSeeds: [...removedSeeds], bots: [...bots.values()].map(b => b.toJSON()) };
   const tmp = DATA_FILE + '.tmp';
   try {
     fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
@@ -603,19 +632,47 @@ function saveAll() {
   } catch (e) { console.error('Saqlashda xato:', e.message); }
 }
 
+function seedBots() {
+  const owner = SEED_OWNER;
+  let added = 0;
+  for (const [wantId, username] of SEED.list) {
+    if (removedSeeds.has(username)) continue;
+    const existing = [...bots.values()].find(b => String(b.owner) === owner && b.host === SEED.host && b.username === username);
+    if (existing) { existing.seed = true; continue; }
+    const id = bots.has(wantId) ? nextBotId++ : wantId;
+    const b = new AfkBot({
+      id, owner, host: SEED.host, port: SEED.port, username, password: SEED.password,
+      version: SEED.version, authMode: SEED.authMode, commands: SEED.commands, afterCmd: SEED.afterCmd,
+      unlimited: true, expiresAt: null, seed: true,
+    });
+    bots.set(id, b);
+    nextBotId = Math.max(nextBotId, id + 1);
+    added++;
+  }
+  if (added) console.log(`${added} ta doimiy bot koddan tiklandi.`);
+}
+
 function loadAll() {
-  if (!fs.existsSync(DATA_FILE)) return;
-  try {
-    const raw = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-    const arr = Array.isArray(raw) ? raw : (raw.bots || []);
-    for (const cfg of arr) {
-      const b = new AfkBot(cfg);
-      bots.set(b.id, b);
+  let raw = {};
+  if (fs.existsSync(DATA_FILE)) {
+    try { raw = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')); }
+    catch (e) {
+      console.error("bots.json o'qishda xato:", e.message);
+      try { fs.copyFileSync(DATA_FILE, DATA_FILE + '.corrupt-' + Date.now()); } catch {}
+      raw = {};
     }
-    nextBotId = Math.max(1, raw.nextId || 1, ...[...bots.keys()].map(i => i + 1));
-    console.log(`${arr.length} ta bot yuklandi (to'xtagan holatda). /bots orqali ishga tushiring.`);
-    if (process.env.AUTOSTART === '1') for (const b of bots.values()) b.start();
-  } catch (e) { console.error("bots.json o'qishda xato:", e.message); }
+  }
+  const arr = Array.isArray(raw) ? raw : (raw.bots || []);
+  if (Array.isArray(raw.removedSeeds)) raw.removedSeeds.forEach(n => removedSeeds.add(n));
+  for (const cfg of arr) {
+    const b = new AfkBot(cfg);
+    bots.set(b.id, b);
+  }
+  nextBotId = Math.max(1, raw.nextId || 1, ...[...bots.keys()].map(i => i + 1));
+  seedBots();
+  saveAll();
+  console.log(`${bots.size} ta bot yuklandi. Doimiy (seed) botlar o'zi ulanadi, qolganlari /bots orqali yoqiladi (yoki AUTOSTART=1).`);
+  for (const b of bots.values()) if (process.env.AUTOSTART === '1' || b.seed) b.start();
 }
 
 function myBots(chatId) { return [...bots.values()].filter(b => String(b.owner) === String(chatId)); }
@@ -1035,6 +1092,7 @@ reg(['/restart'], withBot('Format: /restart <id>', async (msg, b) => {
 
 reg(['/remove'], withBot('Format: /remove <id>', (msg, b) => {
   b.stop();
+  forgetBot(b);
   bots.delete(b.id);
   saveAll();
   send(msg.chat.id, `🗑 #${b.id} o'chirildi.`);
@@ -1204,6 +1262,7 @@ tg.on('callback_query', async q => {
       });
     case 'delok':
       b.stop();
+      forgetBot(b);
       bots.delete(b.id);
       saveAll();
       await answer("O'chirildi");
