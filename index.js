@@ -661,6 +661,8 @@ serverga kiradi → 3s kutadi (/logindelay) → /login (yoki /register) → 15s 
 5) BUYRUQ YUBORISH
 /cmd <id> <buyruq> — serverda buyruq bajarish. Javob 5 soniyadan keyin shu chatga keladi.
    Misol: /cmd 5 /tpa Nick
+/cmd all <buyruq> — hamma ONLAYN botlaringizga bir vaqtda buyruq yuboradi (offline botlar o'tkazib yuboriladi).
+   Misol: /cmd all /warp afk
 /say <id> <matn> — chatga oddiy matn yozish.
    Misol: /say 5 salom
 
@@ -951,11 +953,28 @@ reg(['/status'], (msg, args) => {
   send(chatId, b ? b.statusText() : 'Bunday bot topilmadi.');
 });
 
-reg(['/cmd'], withBot('Format: /cmd <id> <buyruq>\nMasalan: /cmd 5 /tpa Nick', (msg, b, rest) => {
+const cmdOne = withBot('Format: /cmd <id> <buyruq>\nMasalan: /cmd 5 /tpa Nick\nHammasiga: /cmd all /warp afk', (msg, b, rest) => {
   if (!rest) return send(msg.chat.id, 'Buyruq yozilmagan. Masalan: /cmd 5 /tpa Nick');
   const r = b.sendText(normCmd(rest), msg.chat.id);
   send(msg.chat.id, r.ok ? r.msg : `❌ ${r.msg}`);
-}));
+});
+
+reg(['/cmd'], (msg, args) => {
+  const chatId = msg.chat.id;
+  const m = /^all(?:\s+([\s\S]*))?$/i.exec((args || '').trim());
+  if (!m) return cmdOne(msg, args);
+  const text = (m[1] || '').trim();
+  if (!text) return send(chatId, 'Format: /cmd all <buyruq>\nMasalan: /cmd all /warp afk');
+  const c = normCmd(text);
+  if (c.length > CHAT_LIMIT) return send(chatId, `❌ Buyruq juda uzun: ${c.length}/${CHAT_LIMIT} belgi.`);
+  const list = myBots(chatId);
+  const online = list.filter(b => b.online && b.bot);
+  if (!online.length) return send(chatId, `❌ Onlayn bot yo'q (jami ${list.length} ta). Avval ▶️ Start bosing.`);
+  for (const b of online) b.sendText(c, chatId);
+  const skipped = list.filter(b => !online.includes(b));
+  send(chatId, `📤 ${c}\n✅ Yuborildi (${online.length} ta): ${online.map(b => '#' + b.id + ' ' + b.username).join(', ')}` +
+    (skipped.length ? `\n⏭ O'tkazib yuborildi (offline, ${skipped.length} ta): ${skipped.map(b => '#' + b.id).join(', ')}` : ''));
+});
 
 reg(['/say'], withBot('Format: /say <id> <matn>\nMasalan: /say 5 salom', (msg, b, rest) => {
   if (!rest) return send(msg.chat.id, 'Matn yozilmagan.');
