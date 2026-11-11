@@ -36,8 +36,9 @@ const SEED = {
   version: '1.21.1',
   password: 'shukrona',
   authMode: 'login',
-  commands: [],                 // kerak bo'lsa hub buyruqlari: ['/server anarxiya']
+  commands: ['/server anarxiya2'],   // har kirishda (kickdan keyin ham) avval shu, keyin afterCmd
   afterCmd: '/warp afk3',       // hub buyruqlaridan keyingi oxirgi buyruq
+  rev: 2,                       // yuqoridagi sozlamani o'zgartirsangiz rev ni oshiring: mavjud botlar ham yangilanadi
   list: [
     [1, 'Afsona_94'], [2, 'Tufon_28'], [3, 'Yirtqich_51'], [4, 'Qahramon_39'],
     [6, 'Shavkat_46'], [8, 'Zafar_92'], [9, 'Mergan_37'], [11, 'Sarvar_81'],
@@ -52,6 +53,7 @@ const CONNECT_GAP_MS = env('CONNECT_GAP_MS', 12_000);      // botlar orasidagi u
 const CONNECT_TIMEOUT_MS = 60_000;                         // shuncha ichida kirmasa, qayta uriniladi
 const CHAT_GAP_MS = env('CHAT_GAP_MS', 1_500);             // Minecraft chat spam limiti
 const AFTER_CMD_DELAY_MS = env('AFTER_CMD_DELAY_SEC', 5) * 1000; // hub buyruqlaridan keyin oxirgi buyruqqacha kutish
+const PAY_SETTLE_MS = env('PAY_SETTLE_MS', 3_000);                // /pay dan keyin balansni qayta tekshirishdan oldin kutish
 const CHAT_LIMIT = 256;                                    // Minecraft chat xabar uzunligi chegarasi
 const REPLY_WINDOW_MS = env('REPLY_WINDOW_MS', 5_000);     // /cmd javobini shuncha vaqt yig'amiz
 const RECONNECT_BASE_MS = env('RECONNECT_BASE_MS', 15_000);
@@ -122,6 +124,30 @@ function loadUsers() {
 function saveUsers() {
   try { fs.writeFileSync(USERS_FILE, JSON.stringify([...allowedUsers], null, 2)); }
   catch (e) { console.error('users.json saqlashda xato:', e.message); }
+}
+
+// ---- Balans: "Your balance: 823k $" -> { value: 823000, unit: 1000 }
+const BALANCE_RE = /\bbalance\b[^\d\n]{0,20}?(\d[\d.,]*)\s*([kmbt])?(?![a-z])/i;
+const MONEY_UNITS = { k: 1e3, m: 1e6, b: 1e9, t: 1e12 };
+function parseBalanceLine(line) {
+  const m = BALANCE_RE.exec(line);
+  if (!m) return null;
+  const v = parseFloat(m[1].replace(/,/g, '').replace(/\.$/, ''));
+  if (!Number.isFinite(v)) return null;
+  const unit = m[2] ? MONEY_UNITS[m[2].toLowerCase()] : 1;
+  return { value: Math.round(v * unit), unit, raw: m[1] + (m[2] || ''), at: Date.now() };
+}
+function compactMoney(v) {
+  for (const [d, u] of [[1e12, 'T'], [1e9, 'B'], [1e6, 'M'], [1e3, 'K']]) {
+    if (v >= d) return `${+(v / d).toFixed(2)}${u}`;
+  }
+  return String(Math.round(v));
+}
+const fullMoney = v => Math.round(v).toLocaleString('en-US').replace(/,/g, ' ');
+// "pay Nick all" / "/pay Nick all" -> "Nick"
+function parsePayAll(text) {
+  const m = /^\/?pay\s+(\S+)\s+all$/i.exec(String(text || '').trim());
+  return m ? m[1] : null;
 }
 
 function splitMessage(text, max = 3800) {
@@ -201,6 +227,7 @@ class AfkBot {
     this.username = cfg.username;
     this.password = cfg.password;
     this.commands = cfg.commands || [];
+    this.seedRev = cfg.seedRev || 0;
     this.seed = !!cfg.seed;                       // koddan tiklanadigan doimiy bot (har ishga tushganda o'zi ulanadi)
     this.afterCmd = cfg.afterCmd || '';           // hub buyruqlaridan keyingi oxirgi buyruq (masalan /warp afk)
     this.authMode = cfg.authMode || 'login';      // 'login' yoki 'register' (faqat birinchi kirishda)
@@ -218,6 +245,8 @@ class AfkBot {
     this.online = false;
     this.loginSent = false;
     this.registerSent = false;
+    this.balance = null;        // oxirgi ko'ringan balans { value, unit, raw, at }
+    this.paying = false;
     this.status = "to'xtagan";
     this.connectedAt = null;
     this.startedAt = null;
@@ -239,7 +268,7 @@ class AfkBot {
     return {
       id: this.id, owner: this.owner, host: this.host, port: this.port,
       username: this.username, password: this.password, commands: this.commands,
-      afterCmd: this.afterCmd, authMode: this.authMode, seed: this.seed,
+      afterCmd: this.afterCmd, authMode: this.authMode, seed: this.seed, seedRev: this.seedRev,
       version: this.version, loginDelay: this.loginDelay, cmdDelay: this.cmdDelay,
       unlimited: this.unlimited, expiresAt: this.expiresAt, jobs: this.jobs, nextJobId: this.nextJobId,
     };
@@ -390,7 +419,7 @@ class AfkBot {
       this.notify(`Serverdan chiqarildi ❌\nSabab: ${this.lastError}`);
     });
     bot.on('death', () => {
-      this.notify("O'ldi ☠️");
+      // "O'ldi" xabari Telegramga yuborilmaydi, bot jimgina qayta tiriladi
       setTimeout(() => { try { if (this.bot === bot && typeof bot.respawn === 'function') bot.respawn(); } catch {} }, 1500);
     });
     bot.on('error', e => {
@@ -449,6 +478,8 @@ class AfkBot {
     if (this.bot !== bot) return;
     const line = String(raw || '').replace(/§./g, '').trim();
     if (!line) return;
+    const bal = parseBalanceLine(line);
+    if (bal) this.balance = bal;
     this.chatLog.push(line.slice(0, 200));
     if (this.chatLog.length > 15) this.chatLog.shift();
     for (const c of this.captures) c.lines.push(line.slice(0, 300));
@@ -550,6 +581,53 @@ class AfkBot {
     }, REPLY_WINDOW_MS);
   }
 
+  // /balance yuborib, serverdan kelgan "Your balance: ..." ni kutadi
+  async fetchBalance(timeoutMs = 10_000) {
+    if (!this.online || !this.bot) return null;
+    const ep = this.epoch;
+    const t0 = now();
+    this.enqueue('/balance');
+    while (now() - t0 < timeoutMs) {
+      await sleep(250);
+      if (ep !== this.epoch || !this.online) return null;
+      if (this.balance && this.balance.at >= t0) return this.balance;
+    }
+    return null;
+  }
+
+  // Oldin /balance, keyin ko'ringan hamma pulni /pay nick <summa> bilan yuboradi, so'ng balansni qayta tekshiradi
+  async payAll(nick) {
+    if (!this.online || !this.bot) return { ok: false, note: 'bot offline' };
+    if (this.paying) return { ok: false, note: 'oldingi /pay hali tugamagan' };
+    this.paying = true;
+    try {
+      const ep = this.epoch;
+      const before = await this.fetchBalance();
+      if (!before) return { ok: false, note: "balansni o'qib bo'lmadi (server /balance ga javob bermadi)" };
+      let amount = Math.floor(before.value);
+      if (amount < 1) return { ok: false, before, note: 'balans 0' };
+      let lastLines = [];
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        const cap = { lines: [] };
+        this.captures.push(cap);
+        this.enqueue(`/pay ${nick} ${amount}`);
+        await sleep(PAY_SETTLE_MS);
+        this.captures = this.captures.filter(c => c !== cap);
+        lastLines = cap.lines.slice(-3);
+        if (ep !== this.epoch || !this.online) return { ok: false, before, amount, note: "/pay paytida aloqa uzildi, natija noma'lum" };
+        const after = await this.fetchBalance();
+        if (!after) return { ok: false, before, amount, note: "/pay yuborildi, lekin keyingi balansni o'qib bo'lmadi" };
+        if (after.value < before.value) return { ok: true, before, after, amount };
+        // pul ketmadi: ko'rsatilgan balans (masalan 823k) yaxlitlangan bo'lishi mumkin -> bir birlik kamaytirib qayta urinamiz
+        if (attempt === 1 && before.unit > 1 && amount - before.unit >= 1) { amount -= before.unit; continue; }
+        break;
+      }
+      return { ok: false, before, amount, note: `pul o'tmadi. Server javobi: ${lastLines.join(' | ') || '(javob yo\'q)'}` };
+    } finally {
+      this.paying = false;
+    }
+  }
+
   // ---------- jadval (rejalar) ----------
   addJob(job) {
     job.id = this.nextJobId++;
@@ -570,6 +648,14 @@ class AfkBot {
       : `har ${humanDur(j.everyMs)}da → ${j.cmd}`;
   }
 
+  runJobCmd(cmd) {
+    const nick = parsePayAll(cmd);
+    if (!nick) return this.enqueue(cmd);
+    this.payAll(nick).then(r => this.notify(r.ok
+      ? `💸 ${nick} ga yuborildi: ${fullMoney(r.amount)} (qoldiq: ${compactMoney(r.after.value)})`
+      : `⚠️ /pay ${nick} all bajarilmadi: ${r.note}`));
+  }
+
   runDueJobs() {
     if (this.stopped || !this.jobs.length) return;
     const t = now();
@@ -577,7 +663,7 @@ class AfkBot {
     for (const job of [...this.jobs]) {
       if (job.kind === 'once') {
         if (t < job.runAt || !this.online) continue; // bot onlayn bo'lguncha kutadi
-        this.enqueue(job.cmd);
+        this.runJobCmd(job.cmd);
         this.notify(`⏰ Rejalashtirilgan buyruq yuborildi: ${job.cmd}`);
         this.jobs = this.jobs.filter(j => j !== job);
         changed = true;
@@ -585,7 +671,7 @@ class AfkBot {
         job.nextAt = t + job.everyMs;
         changed = true;
         if (this.online) {
-          this.enqueue(job.cmd);
+          this.runJobCmd(job.cmd);
           this.notify(`🔁 Jadval buyrug'i yuborildi: ${job.cmd}`);
         } else {
           this.notify(`⚠️ Jadval o'tkazib yuborildi (bot offline): ${job.cmd}`);
@@ -609,6 +695,7 @@ class AfkBot {
     lines.push(`⚙️ Login: ${this.loginSec()}s, birinchi buyruq: ${this.cmdSec()}s keyin`);
     lines.push(`📜 Hub buyruqlari: ${this.commands.length ? this.commands.join(' | ') : "yo'q"}`);
     lines.push(`🏁 Oxirgi buyruq: ${this.afterCmd || "yo'q"}`);
+    if (this.balance) lines.push(`💰 Balans: ${compactMoney(this.balance.value)} (${fullMoney(this.balance.value)})`);
     lines.push(`🗓 Rejalar: ${this.jobs.length ? this.jobs.length + ' ta (/jobs ' + this.id + ')' : "yo'q"}`);
     lines.push(`⚠️ Oxirgi xato: ${this.lastError}`);
     if (this.chatLog.length) lines.push(`\n💬 Oxirgi chat:\n${this.chatLog.slice(-5).join('\n')}`);
@@ -638,12 +725,22 @@ function seedBots() {
   for (const [wantId, username] of SEED.list) {
     if (removedSeeds.has(username)) continue;
     const existing = [...bots.values()].find(b => String(b.owner) === owner && b.host === SEED.host && b.username === username);
-    if (existing) { existing.seed = true; continue; }
+    if (existing) {
+      existing.seed = true;
+      if ((existing.seedRev || 0) < SEED.rev) {
+        existing.commands = [...SEED.commands];
+        existing.afterCmd = SEED.afterCmd;
+        existing.version = SEED.version;
+        existing.port = SEED.port;
+        existing.seedRev = SEED.rev;
+      }
+      continue;
+    }
     const id = bots.has(wantId) ? nextBotId++ : wantId;
     const b = new AfkBot({
       id, owner, host: SEED.host, port: SEED.port, username, password: SEED.password,
       version: SEED.version, authMode: SEED.authMode, commands: SEED.commands, afterCmd: SEED.afterCmd,
-      unlimited: true, expiresAt: null, seed: true,
+      unlimited: true, expiresAt: null, seed: true, seedRev: SEED.rev,
     });
     bots.set(id, b);
     nextBotId = Math.max(nextBotId, id + 1);
@@ -777,6 +874,19 @@ Har bir odam o'z Telegram ID si bilan ishlatadi. Har kim faqat o'z botlarini ko'
 /removeuser <id> — foydalanuvchini o'chirish, uning botlari to'xtatiladi (faqat admin)
 /users — ruxsatli foydalanuvchilar ro'yxati (faqat admin)
 
+13) MENYU TUGMALARI VA OMMAVIY BUYRUQLAR
+/start yoki /menu — pastda tugmalar chiqadi:
+🤖 Mening botlarim • 💰 Balanslar • ➕ 1 ta bot qo'shish • ⚡ Tezkor 10 ta bot qo'shish
+📢 Barchaga buyruq • 🎯 Tanlanganlarga buyruq • ▶️ Barchasini yoqish • ⏹ Barchasini to'xtatish
+⚡ Tezkor 10 ta bot: prefiks yozasiz (masalan AfkQirollari) → AfkQirollari_01 ... _10 bir xil sozlama bilan qo'shiladi.
+💰 Balanslar (/balans): har bot /balance qiladi, ro'yxatda 💰 11K (11 000) ko'rinishida chiqadi.
+/cmd all <buyruq> — hamma onlayn botlarga buyruq. Misol: /cmd all /warp afk3
+/cmd all pay Zahriddin all — har bot oldin /balance qiladi, ko'ringan hamma pulini Zahriddin ga /pay qiladi, so'ng balansni qayta tekshirib natijani yozadi.
+/auto all <vaqt> <buyruq> — hamma botlarga takrorlanuvchi reja. Misol: /auto all 3d /home home
+/delay all <vaqt> <buyruq> — hamma botlarga bir martalik reja
+/jobclear <id|all> — rejalarni tozalash
+/runall, /stopall — hammasini yoqish / to'xtatish
+
 • Bu qo'llanmani qayta ko'rish uchun: /help`;
 
 // ---------------- TELEGRAM: MENYU MATNLARI ----------------
@@ -838,12 +948,101 @@ function newBotDone(b) {
     `Holat: /status ${b.id}   Boshqarish: /bots   Qo'llanma: /help`;
 }
 
+// ---------------- OMMAVIY BUYRUQ / BALANS YORDAMCHILARI ----------------
+// Berilgan botlarga buyruq yuboradi. "pay <nick> all" bo'lsa: oldin /balance, keyin hamma pulni /pay qiladi.
+async function runOnBots(chatId, list, text) {
+  const c = normCmd(text);
+  if (c.length > CHAT_LIMIT) return send(chatId, `❌ Buyruq juda uzun: ${c.length}/${CHAT_LIMIT} belgi.`);
+  const online = list.filter(b => b.online && b.bot);
+  if (!online.length) return send(chatId, `❌ Onlayn bot yo'q (jami ${list.length} ta). Avval ▶️ Start bosing.`);
+  const skipped = list.filter(b => !online.includes(b));
+  const skipNote = skipped.length ? `\n⏭ O'tkazib yuborildi (offline, ${skipped.length} ta): ${skipped.map(b => '#' + b.id).join(', ')}` : '';
+  const payNick = parsePayAll(c);
+  if (payNick) return payAllBots(chatId, online, payNick, skipNote);
+  for (const b of online) b.sendText(c, chatId);
+  return send(chatId, `📤 ${c}\n✅ Yuborildi (${online.length} ta): ${online.map(b => '#' + b.id + ' ' + b.username).join(', ')}${skipNote}`);
+}
+
+async function payAllBots(chatId, online, nick, skipNote = '') {
+  const targets = online.filter(b => b.username.toLowerCase() !== nick.toLowerCase());
+  if (!targets.length) return send(chatId, `❌ Yuboradigan bot yo'q (${nick} ning o'zi bot).`);
+  await send(chatId, `💸 ${targets.length} ta bot avval /balance tekshiradi, keyin hamma pulini ${nick} ga /pay qiladi.\nNatija ~${Math.round(8 + PAY_SETTLE_MS / 1000 * 2)}–30 soniyada keladi...`);
+  const results = await Promise.all(targets.map(async b => ({ b, r: await b.payAll(nick) })));
+  let total = 0, okN = 0;
+  const lines = results.map(({ b, r }) => {
+    if (r.ok) {
+      total += r.amount; okN++;
+      return `✅ #${b.id} ${b.username}: ${compactMoney(r.before.value)} → ${compactMoney(r.after.value)} (yuborildi: ${fullMoney(r.amount)})`;
+    }
+    return `⚠️ #${b.id} ${b.username}: ${r.note}${r.before ? ` (balans: ${compactMoney(r.before.value)})` : ''}`;
+  });
+  return sendLong(chatId, `💸 Natija → ${nick}\n${lines.join('\n')}\n\nJami yuborildi: ~${fullMoney(total)} (${compactMoney(total)}) — ${okN}/${targets.length} bot${skipNote}`);
+}
+
+function balanceList(chatId) {
+  return myBots(chatId).sort((x, y) => (y.balance ? y.balance.value : -1) - (x.balance ? x.balance.value : -1));
+}
+function balanceText(chatId) {
+  const list = balanceList(chatId);
+  const known = list.filter(b => b.balance);
+  const total = known.reduce((n, b) => n + b.balance.value, 0);
+  return `💰 Balanslar — ${list.length} ta bot (onlayn: ${list.filter(b => b.online).length})\n` +
+    `Jami: ${compactMoney(total)} (${fullMoney(total)})\n` +
+    `Offline botlarda oxirgi ko'ringan balans.\n🕒 ${new Date().toLocaleTimeString('en-GB')}`;
+}
+function balanceKeyboard(chatId) {
+  const rows = balanceList(chatId).slice(0, 95).map(b => [{
+    text: `${b.icon()} ${b.username} | 💰 ${b.balance ? `${compactMoney(b.balance.value)} (${fullMoney(b.balance.value)})` : '—'}`,
+    callback_data: `sel:${b.id}`,
+  }]);
+  rows.push([{ text: '🔄 Yangilash', callback_data: 'balref' }]);
+  return { inline_keyboard: rows };
+}
+async function refreshBalances(chatId) {
+  await Promise.all(myBots(chatId).filter(b => b.online && b.bot).map(b => b.fetchBalance(8000)));
+}
+async function showBalances(chatId) {
+  if (!myBots(chatId).length) return send(chatId, "Hali bot yo'q. ➕ 1 ta bot qo'shish tugmasini bosing.");
+  const n = myBots(chatId).filter(b => b.online && b.bot).length;
+  if (n) await send(chatId, `⏳ ${n} ta onlayn botdan /balance so'ralmoqda...`);
+  await refreshBalances(chatId);
+  return send(chatId, balanceText(chatId), { reply_markup: balanceKeyboard(chatId) });
+}
+
+// ---------------- TANLANGANLARGA BUYRUQ ----------------
+const selections = new Map(); // chatId -> Set(botId)
+function selectText(chatId) {
+  const sel = selections.get(chatId) || new Set();
+  return `🎯 Botlarni tanlang (${sel.size} ta tanlandi). Keyin ➡️ Davom etish ni bosing.`;
+}
+function selectKeyboard(chatId) {
+  const sel = selections.get(chatId) || new Set();
+  const list = myBots(chatId).slice(0, 90);
+  const rows = [];
+  for (let i = 0; i < list.length; i += 2) {
+    rows.push(list.slice(i, i + 2).map(b => ({
+      text: `${sel.has(b.id) ? '✅' : '⬜'} #${b.id} ${b.username}${b.online ? '' : ' ⚫'}`,
+      callback_data: `selt:${b.id}`,
+    })));
+  }
+  rows.push([{ text: '☑️ Hammasi', callback_data: 'selall' }, { text: '🟢 Onlaynlar', callback_data: 'selon' }, { text: '⬜ Tozalash', callback_data: 'selclr' }]);
+  rows.push([{ text: `➡️ Davom etish (${sel.size})`, callback_data: 'seldone' }]);
+  return { inline_keyboard: rows };
+}
+
 // ---------------- YANGI BOT (QADAMMA-QADAM) ----------------
-const flows = new Map(); // chatId -> { step, data, botId? }
+const flows = new Map(); // chatId -> { step, data, bulk?, botId?, ids? }
+const BULK_COUNT = 10;
+const stepNo = (flow, n) => `${n}/${flow.bulk ? 6 : 7}`;
 
 function startFlow(chatId) {
   flows.set(chatId, { step: 'ip', data: {} });
   send(chatId, "🌐 1/7 — Server manzilini yozing (ip yoki domen, port bilan)\nMasalan: play.example.uz:25565\n\nBekor qilish: /cancel");
+}
+
+function startBulkFlow(chatId) {
+  flows.set(chatId, { step: 'ip', data: {}, bulk: true });
+  send(chatId, `⚡ Tezkor ${BULK_COUNT} ta bot qo'shish\n🌐 1/6 — Server manzilini yozing (ip yoki domen, port bilan)\nMasalan: play.example.uz:25565\n\nBekor qilish: /cancel`);
 }
 
 function createBotFromFlow(chatId, data, planKey) {
@@ -853,6 +1052,21 @@ function createBotFromFlow(chatId, data, planKey) {
   b.start();
   saveAll();
   return b;
+}
+
+function createBulkFromFlow(chatId, data) {
+  const { nicks, ...cfg } = data;
+  const created = [], skipped = [];
+  for (const username of nicks) {
+    const dup = [...bots.values()].some(b => b.host === cfg.host && Number(b.port) === Number(cfg.port) && b.username === username);
+    if (dup) { skipped.push(username); continue; }
+    const b = new AfkBot({ id: nextBotId++, owner: chatId, ...cfg, username, unlimited: true, expiresAt: null });
+    bots.set(b.id, b);
+    b.start();
+    created.push(b);
+  }
+  saveAll();
+  return { created, skipped };
 }
 
 async function handleFlow(msg, text) {
@@ -869,10 +1083,25 @@ async function handleFlow(msg, text) {
       }
       Object.assign(flow.data, { host, port });
       flow.step = 'nick';
-      send(chatId, '👤 2/7 — Bot nikini yozing (3–16 belgi: harf, raqam, _)');
+      send(chatId, flow.bulk
+        ? `👤 2/6 — Nik prefiksini yozing. Botlar prefiks_01 ... prefiks_${String(BULK_COUNT).padStart(2, '0')} bo'ladi.\nMasalan: AfkQirollari  (max 13 belgi)\nBoshqa raqamdan boshlash: AfkQirollari 11`
+        : '👤 2/7 — Bot nikini yozing (3–16 belgi: harf, raqam, _)');
       return true;
     }
     case 'nick': {
+      if (flow.bulk) {
+        const m = /^(\w{1,13})(?:\s+(\d{1,3}))?$/.exec(text);
+        const start = m && m[2] ? Number(m[2]) : 1;
+        const nicks = m ? Array.from({ length: BULK_COUNT }, (_, i) => `${m[1]}_${String(start + i).padStart(2, '0')}`) : [];
+        if (!m || !nicks.every(validNick)) {
+          send(chatId, "❌ Prefiks noto'g'ri. Harf/raqam/_ , 1–13 belgi. Masalan: AfkQirollari");
+          return true;
+        }
+        flow.data.nicks = nicks;
+        flow.step = 'pass';
+        send(chatId, `✅ Nomlar: ${nicks[0]} ... ${nicks[nicks.length - 1]}\n🔑 3/6 — Parolni yozing (hammasiga bir xil).\n• Oddiy parol yoki /login parol → /login\n• /register parol parol → birinchi kirishda ro'yxatdan o'tadi (keyin /login)\nParol xabari o'chiriladi.`);
+        return true;
+      }
       if (!validNick(text)) { send(chatId, "❌ Nik noto'g'ri. 3–16 belgi: harf, raqam yoki _"); return true; }
       flow.data.username = text;
       flow.step = 'pass';
@@ -894,7 +1123,7 @@ async function handleFlow(msg, text) {
       flow.data.authMode = mode;
       flow.step = 'version';
       tg.deleteMessage(chatId, msg.message_id).catch(() => {});
-      send(chatId, `${mode === 'register' ? '📝 /register rejimi tanlandi.\n' : ''}🎮 4/7 — Minecraft versiyasi (masalan 1.21.1). Bilmasangiz: -`);
+      send(chatId, `${mode === 'register' ? '📝 /register rejimi tanlandi.\n' : ''}🎮 ${stepNo(flow, 4)} — Minecraft versiyasi (masalan 1.21.1). Bilmasangiz: -`);
       return true;
     }
     case 'version': {
@@ -902,7 +1131,7 @@ async function handleFlow(msg, text) {
       else if (validVersion(text)) flow.data.version = text;
       else { send(chatId, '❌ Versiya formati: 1.21.1 yoki -'); return true; }
       flow.step = 'cmds';
-      send(chatId, "📜 5/7 — Kirgach yuboriladigan hub buyruqlari, har birini yangi qatorga yozing.\nMasalan:\n/server anarxiya\nYo'q bo'lsa: -");
+      send(chatId, `📜 ${stepNo(flow, 5)} — Kirgach yuboriladigan hub buyruqlari, har birini yangi qatorga yozing.\nMasalan:\n/server anarxiya\nYo'q bo'lsa: -`);
       return true;
     }
     case 'cmds': {
@@ -910,7 +1139,7 @@ async function handleFlow(msg, text) {
       if (cmds.some(c => c.length > CHAT_LIMIT)) { send(chatId, `❌ Buyruq juda uzun (${CHAT_LIMIT} belgi chegarasi).`); return true; }
       flow.data.commands = cmds;
       flow.step = 'afkcmd';
-      send(chatId, "🏁 6/7 — Hub buyruqlaridan keyin yuboriladigan bitta oxirgi buyruq.\nMasalan: /warp afk  (yoki shunchaki: warp afk)\nYo'q bo'lsa: -");
+      send(chatId, `🏁 ${stepNo(flow, 6)} — Hub buyruqlaridan keyin yuboriladigan bitta oxirgi buyruq.\nMasalan: /warp afk  (yoki shunchaki: warp afk)\nYo'q bo'lsa: -`);
       return true;
     }
     case 'afkcmd': {
@@ -920,6 +1149,15 @@ async function handleFlow(msg, text) {
         const c = normCmd(text);
         if (c.length > CHAT_LIMIT) { send(chatId, `❌ Buyruq juda uzun (${CHAT_LIMIT} belgi chegarasi).`); return true; }
         flow.data.afterCmd = c;
+      }
+      if (flow.bulk) {
+        flows.delete(chatId);
+        const { created, skipped } = createBulkFromFlow(chatId, flow.data);
+        send(chatId, `⚡ ${created.length} ta bot qo'shildi${created.length ? `: #${created[0].id} – #${created[created.length - 1].id}` : ''}\n` +
+          `Server: ${flow.data.host}:${flow.data.port}\n` +
+          (skipped.length ? `⏭ Allaqachon bor, o'tkazildi: ${skipped.join(', ')}\n` : '') +
+          `Ular 12s oralatib ulanadi (taxminan ${created.length * 12}s). Muddat: ♾ cheksiz.\nHolat: 🤖 Mening botlarim`);
+        return true;
       }
       flow.step = 'plan';
       send(chatId, "⏳ 7/7 — Tarifni tanlang. Muddat tugagach bot o'zi to'xtaydi:", {
@@ -934,8 +1172,22 @@ async function handleFlow(msg, text) {
       flows.delete(chatId);
       const b = bots.get(flow.botId);
       if (!b || String(b.owner) !== String(chatId)) { send(chatId, 'Bot topilmadi.'); return true; }
+      if (parsePayAll(normCmd(text))) { await runOnBots(chatId, [b], text); return true; }
       const r = b.sendText(text.startsWith('/') ? text : normCmd(text), chatId);
       send(chatId, r.ok ? r.msg : `❌ ${r.msg}`);
+      return true;
+    }
+    case 'allcmd': {
+      flows.delete(chatId);
+      await runOnBots(chatId, myBots(chatId), text);
+      return true;
+    }
+    case 'selcmd': {
+      flows.delete(chatId);
+      selections.delete(chatId);
+      const list = (flow.ids || []).map(id => getMine(chatId, id)).filter(Boolean);
+      if (!list.length) { send(chatId, 'Tanlangan botlar topilmadi.'); return true; }
+      await runOnBots(chatId, list, text);
       return true;
     }
   }
@@ -958,7 +1210,12 @@ function withBot(usage, fn) {
   };
 }
 
-reg(['/start', '/add'], async msg => { await sendLong(msg.chat.id, GUIDE); startFlow(msg.chat.id); });
+reg(['/start'], async msg => { await sendLong(msg.chat.id, GUIDE); send(msg.chat.id, '👇 Menyu tugmalari pastda. Qayta chiqarish: /menu', { reply_markup: mainKeyboard() }); });
+reg(['/menu'], msg => send(msg.chat.id, '👇 Menyu', { reply_markup: mainKeyboard() }));
+reg(['/add'], msg => startFlow(msg.chat.id));
+reg(['/balans', '/balance'], msg => showBalances(msg.chat.id));
+reg(['/runall'], msg => menuRunAll(msg.chat.id));
+reg(['/stopall'], msg => menuStopAll(msg.chat.id));
 reg(['/help'], msg => sendLong(msg.chat.id, GUIDE));
 reg(['/cancel'], msg => { flows.delete(msg.chat.id); send(msg.chat.id, 'Bekor qilindi.'); });
 reg(['/adduser'], (msg, args) => {
@@ -1010,8 +1267,9 @@ reg(['/status'], (msg, args) => {
   send(chatId, b ? b.statusText() : 'Bunday bot topilmadi.');
 });
 
-const cmdOne = withBot('Format: /cmd <id> <buyruq>\nMasalan: /cmd 5 /tpa Nick\nHammasiga: /cmd all /warp afk', (msg, b, rest) => {
+const cmdOne = withBot('Format: /cmd <id> <buyruq>\nMasalan: /cmd 5 /tpa Nick\nHammasiga: /cmd all /warp afk3', (msg, b, rest) => {
   if (!rest) return send(msg.chat.id, 'Buyruq yozilmagan. Masalan: /cmd 5 /tpa Nick');
+  if (parsePayAll(normCmd(rest))) return runOnBots(msg.chat.id, [b], rest);
   const r = b.sendText(normCmd(rest), msg.chat.id);
   send(msg.chat.id, r.ok ? r.msg : `❌ ${r.msg}`);
 });
@@ -1021,16 +1279,8 @@ reg(['/cmd'], (msg, args) => {
   const m = /^all(?:\s+([\s\S]*))?$/i.exec((args || '').trim());
   if (!m) return cmdOne(msg, args);
   const text = (m[1] || '').trim();
-  if (!text) return send(chatId, 'Format: /cmd all <buyruq>\nMasalan: /cmd all /warp afk');
-  const c = normCmd(text);
-  if (c.length > CHAT_LIMIT) return send(chatId, `❌ Buyruq juda uzun: ${c.length}/${CHAT_LIMIT} belgi.`);
-  const list = myBots(chatId);
-  const online = list.filter(b => b.online && b.bot);
-  if (!online.length) return send(chatId, `❌ Onlayn bot yo'q (jami ${list.length} ta). Avval ▶️ Start bosing.`);
-  for (const b of online) b.sendText(c, chatId);
-  const skipped = list.filter(b => !online.includes(b));
-  send(chatId, `📤 ${c}\n✅ Yuborildi (${online.length} ta): ${online.map(b => '#' + b.id + ' ' + b.username).join(', ')}` +
-    (skipped.length ? `\n⏭ O'tkazib yuborildi (offline, ${skipped.length} ta): ${skipped.map(b => '#' + b.id).join(', ')}` : ''));
+  if (!text) return send(chatId, 'Format: /cmd all <buyruq>\nMasalan: /cmd all /warp afk3\nBarcha pulni yig\'ish: /cmd all pay Zahriddin all');
+  return runOnBots(chatId, myBots(chatId), text);
 });
 
 reg(['/say'], withBot('Format: /say <id> <matn>\nMasalan: /say 5 salom', (msg, b, rest) => {
@@ -1155,6 +1405,110 @@ reg(['/version'], withBot('Format: /version <id> <versiya|auto>\nMasalan: /versi
   send(msg.chat.id, `🎮 #${b.id}: versiya ${b.version || 'avto'}. Keyingi ulanishda kuchga kiradi (🔄 Restart).`);
 }));
 
+// "all" varianti: /auto all <vaqt> <buyruq>  va  /delay all <vaqt> <buyruq>
+function wrapAll(name, handlerAll) {
+  const orig = COMMANDS[name];
+  COMMANDS[name] = (msg, args) => {
+    const m = /^all\s+([\s\S]+)$/i.exec((args || '').trim());
+    return m ? handlerAll(msg, m[1].trim()) : orig(msg, args);
+  };
+}
+function parseTimeAndCmd(chatId, rest, example) {
+  const m = /^(\S+)\s+([\s\S]+)$/.exec(rest);
+  const ms = m ? parseDuration(m[1]) : null;
+  if (!ms) { send(chatId, `Vaqt noto'g'ri. Masalan: ${example}`); return null; }
+  const c = normCmd(m[2]);
+  if (c.length > CHAT_LIMIT) { send(chatId, `❌ Buyruq juda uzun (${CHAT_LIMIT} belgi chegarasi).`); return null; }
+  const list = myBots(chatId);
+  if (!list.length) { send(chatId, "Hali bot yo'q."); return null; }
+  return { ms, c, list };
+}
+wrapAll('/auto', (msg, rest) => {
+  const chatId = msg.chat.id;
+  const p = parseTimeAndCmd(chatId, rest, '/auto all 3d /home home');
+  if (!p) return;
+  if (p.ms < MIN_AUTO_MS) return send(chatId, "❌ Eng kam takrorlash oralig'i: 30s");
+  for (const b of p.list) b.addJob({ kind: 'auto', cmd: p.c, everyMs: p.ms, nextAt: now() + p.ms });
+  send(chatId, `🔁 ${p.list.length} ta botga: "${p.c}" har ${humanDur(p.ms)}da takrorlanadi.\nOffline bo'lgan botda o'sha payt o'tkaziladi.\nRejalarni tozalash: /jobclear all`);
+});
+wrapAll('/delay', (msg, rest) => {
+  const chatId = msg.chat.id;
+  const p = parseTimeAndCmd(chatId, rest, '/delay all 2h /server anarxiya2');
+  if (!p) return;
+  for (const b of p.list) b.addJob({ kind: 'once', cmd: p.c, runAt: now() + p.ms });
+  send(chatId, `⏰ ${p.list.length} ta botga: ${humanDur(p.ms)}dan keyin "${p.c}" bir marta yuboriladi.`);
+});
+reg(['/jobclear'], (msg, args) => {
+  const chatId = msg.chat.id;
+  const a = (args || '').trim().toLowerCase();
+  const list = a === 'all' ? myBots(chatId) : [getMine(chatId, a)].filter(Boolean);
+  if (!list.length) return send(chatId, 'Format: /jobclear <id|all>');
+  let n = 0;
+  for (const b of list) { n += b.jobs.length; b.jobs = []; }
+  saveAll();
+  send(chatId, `🗑 ${list.length} ta botdan ${n} ta reja o'chirildi.`);
+});
+
+// ---------------- MENYU TUGMALARI ----------------
+const MENU = {
+  bots: '🤖 Mening botlarim',
+  balance: '💰 Balanslar',
+  add1: "➕ 1 ta bot qo'shish",
+  add10: "⚡ Tezkor 10 ta bot qo'shish",
+  all: '📢 Barchaga buyruq yuborish',
+  sel: '🎯 Tanlanganlarga buyruq',
+  runAll: '▶️ Barchasini yoqish',
+  stopAll: "⏹ Barchasini to'xtatish",
+};
+function mainKeyboard() {
+  return {
+    keyboard: [
+      [{ text: MENU.bots }, { text: MENU.balance }],
+      [{ text: MENU.add1 }, { text: MENU.add10 }],
+      [{ text: MENU.all }, { text: MENU.sel }],
+      [{ text: MENU.runAll }, { text: MENU.stopAll }],
+    ],
+    resize_keyboard: true,
+    is_persistent: true,
+  };
+}
+function menuRunAll(chatId) {
+  const list = myBots(chatId);
+  if (!list.length) return send(chatId, "Hali bot yo'q.");
+  let started = 0, expired = 0, already = 0;
+  for (const b of list) {
+    if (!b.stopped) { already++; continue; }
+    if (b.start()) started++; else expired++;
+  }
+  send(chatId, `▶️ Yoqildi: ${started} ta\nAllaqachon ishlayotgan: ${already} ta` + (expired ? `\n⏳ Muddati tugagan: ${expired} ta` : '') +
+    (started ? `\nBotlar 12s oralatib ulanadi (taxminan ${started * 12}s).` : ''));
+}
+function menuStopAll(chatId) {
+  const list = myBots(chatId);
+  if (!list.length) return send(chatId, "Hali bot yo'q.");
+  let n = 0;
+  for (const b of list) if (!b.stopped) { b.stop(); n++; }
+  send(chatId, `⏹ To'xtatildi: ${n} ta bot.`);
+}
+const MENU_ACTIONS = {
+  [MENU.bots]: chatId => send(chatId, listText(chatId), { reply_markup: listKeyboard(chatId) }),
+  [MENU.balance]: chatId => showBalances(chatId),
+  [MENU.add1]: chatId => startFlow(chatId),
+  [MENU.add10]: chatId => startBulkFlow(chatId),
+  [MENU.all]: chatId => {
+    if (!myBots(chatId).length) return send(chatId, "Hali bot yo'q.");
+    flows.set(chatId, { step: 'allcmd', data: {} });
+    send(chatId, "📢 Barcha ONLAYN botlarga yuboriladigan buyruqni yozing.\nMasalan: /warp afk3   yoki   /balance\nBarcha pulni yig'ish: pay Zahriddin all\nBekor qilish: /cancel");
+  },
+  [MENU.sel]: chatId => {
+    if (!myBots(chatId).length) return send(chatId, "Hali bot yo'q.");
+    selections.set(chatId, new Set());
+    send(chatId, selectText(chatId), { reply_markup: selectKeyboard(chatId) });
+  },
+  [MENU.runAll]: chatId => menuRunAll(chatId),
+  [MENU.stopAll]: chatId => menuStopAll(chatId),
+};
+
 // ---------------- MATN XABARLARI (ROUTER) ----------------
 tg.on('message', async msg => {
   const chatId = msg.chat.id;
@@ -1168,6 +1522,10 @@ tg.on('message', async msg => {
   if (!isAllowed(msg.from.id)) {
     if (text.startsWith('/')) send(chatId, "⛔ Ruxsat yo'q. Ruxsat uchun /myid orqali ID ni yuboring.");
     return;
+  }
+  if (Object.prototype.hasOwnProperty.call(MENU_ACTIONS, text)) {
+    flows.delete(chatId);
+    return MENU_ACTIONS[text](chatId);
   }
   if (COMMANDS[first]) return COMMANDS[first](msg, text.slice(raw.length).trim());
   if (await handleFlow(msg, text)) return;
@@ -1201,6 +1559,30 @@ tg.on('callback_query', async q => {
     const b = createBotFromFlow(chatId, flow.data, a);
     await answer('Bot ishga tushdi ▶️');
     return edit(newBotDone(b), { inline_keyboard: [] });
+  }
+
+  if (act === 'balref') {
+    await answer('Yangilanmoqda...');
+    await refreshBalances(chatId);
+    return edit(balanceText(chatId), balanceKeyboard(chatId));
+  }
+  if (['selt', 'selall', 'selon', 'selclr', 'seldone'].includes(act)) {
+    const sel = selections.get(chatId) || new Set();
+    selections.set(chatId, sel);
+    if (act === 'selt') {
+      const tb = getMine(chatId, a);
+      if (tb) { if (sel.has(tb.id)) sel.delete(tb.id); else sel.add(tb.id); }
+    } else if (act === 'selall') myBots(chatId).forEach(x => sel.add(x.id));
+    else if (act === 'selon') { sel.clear(); myBots(chatId).filter(x => x.online).forEach(x => sel.add(x.id)); }
+    else if (act === 'selclr') sel.clear();
+    else if (act === 'seldone') {
+      if (!sel.size) return answer('Hech narsa tanlanmadi', true);
+      flows.set(chatId, { step: 'selcmd', ids: [...sel], data: {} });
+      await answer();
+      return send(chatId, `🎯 Tanlangan ${sel.size} ta bot: ${[...sel].map(i => '#' + i).join(', ')}\nEndi buyruqni yozing (masalan /warp afk3 yoki pay Zahriddin all).\nBekor qilish: /cancel`);
+    }
+    await answer();
+    return edit(selectText(chatId), selectKeyboard(chatId));
   }
 
   const b = getMine(chatId, a);
